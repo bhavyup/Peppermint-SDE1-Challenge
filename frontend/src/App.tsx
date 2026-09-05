@@ -3,6 +3,7 @@ import type { RobotMeta, RobotState } from './types';
 import { needsAttention, STATUS_COLORS } from './types';
 import { parseLog, eventsBetween, type LogData } from './sim/replay';
 import { LiveFeedSimulator } from './sim/liveFeed';
+import { gridFromImage, type Grid } from './sim/occupancy';
 import { createStore, ingest, seek, type FleetStore } from './state/fleetStore';
 import MapView from './components/MapView';
 import TrendChart from './components/TrendChart';
@@ -24,6 +25,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [attentionOnly, setAttentionOnly] = useState(false);
   const liveSim = useRef<LiveFeedSimulator | null>(null);
+  const grid = useRef<Grid | null>(null);
 
   // Load data
   useEffect(() => {
@@ -37,6 +39,12 @@ export default function App() {
       setMetas(robotsJson);
       setData(logData);
       setStore(createStore(logData));
+      // Build the wall grid for live-feed routing once the layout image loads.
+      const img = new Image();
+      img.src = `${base}layout.png`;
+      img.onload = () => {
+        grid.current = gridFromImage(img);
+      };
     })();
   }, []);
 
@@ -59,7 +67,7 @@ export default function App() {
         }
         // live mode
         if (!liveSim.current) {
-          liveSim.current = new LiveFeedSimulator([...prev.robots.values()], 1337, prev.simTime);
+          liveSim.current = new LiveFeedSimulator([...prev.robots.values()], 1337, prev.simTime, grid.current);
         }
         const dt = (TICK_MS / 1000) * LIVE_SPEED;
         const evs = liveSim.current.step(dt);

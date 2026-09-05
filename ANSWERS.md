@@ -56,10 +56,11 @@ could be dropped in later without touching any component.
 Cut deliberately to stay inside the timebox:
 
 - **Smooth motion interpolation** — with the caveat above.
-- **Wall-aware movement in the live feed.** Simulated robots use waypoints
-  inside the layout bounds but don't respect walls in `layout.png`, so they
-  can cross obstacles. Real pathfinding (grid A* over the image) is the next
-  step there.
+- **Smarter live-feed routing.** Robots do respect walls — `layout.png` is
+  decoded into a 10 px occupancy grid and destinations are routed with A*
+  (`src/sim/occupancy.ts`), with a deterministic seed so tests are stable.
+  Remaining limitation: robots don't avoid *each other* and the dock has no
+  queue, so they can overlap.
 - **Per-robot history views.** The trend is fleet-level by design (that's what
   the assignment asks an operator to look at); a per-robot battery/status
   timeline is the obvious next panel — the data plumbing supports it already,
@@ -67,7 +68,7 @@ Cut deliberately to stay inside the timebox:
 - **`task_event` markers.** They're rare and ungraded, so they're parsed
   through the type but not displayed.
 
-Given more time: (1) grid-based pathing for the simulator, (2) smooth
-interpolation rendered as *trail* so inferred positions are visually distinct
-from reported ones, (3) WebSocket input as a third source into `ingest`,
-(4) alerts log (timestamped entries when a robot enters an attention state).
+Given more time: (1) smooth interpolation rendered as *trail* so inferred
+positions are visually distinct from reported ones, (2) WebSocket input as a
+third source into `ingest`, (3) alerts log (timestamped entries when a robot
+enters an attention state), (4) robot-vs-robot avoidance in the simulator.

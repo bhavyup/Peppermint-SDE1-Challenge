@@ -1,14 +1,19 @@
 import type { RobotEvent, RobotState, RobotStatus } from '../types';
+import { findPath, isFree, type Grid } from './occupancy';
 
 /**
  * Client-side live feed: one independent walker per robot, seeded from the
  * final replayed state. Emits one event per robot every EMIT_SECONDS of sim
  * time, so downstream views treat it exactly like replay data.
+ *
+ * If an occupancy Grid (from layout.png) is supplied, robots route around
+ * walls with A*; otherwise they fall back to straight-line waypoints.
  */
 
 export const EMIT_SECONDS = 3;
 
-const ARENA = { minX: 20, maxX: 880, minY: 20, maxY: 540 }; // inside layout bounds
+// Fallback bounds when no grid is available; with a grid the arena follows it.
+const FALLBACK_ARENA = { minX: 20, maxX: 880, minY: 20, maxY: 540 };
 const CHARGE_DOCK = { x: 40, y: 40 };
 
 // Small deterministic PRNG so tests are stable.
@@ -29,7 +34,8 @@ type Walker = {
   y: number;
   status: RobotStatus;
   battery: number;
-  target: { x: number; y: number } | null;
+  path: { x: number; y: number }[] | null; // remaining waypoints; null = parked
+  headingToCharge: boolean;
   statusTimer: number; // seconds remaining in a fixed-duration status (blocked/error)
 };
 
@@ -43,17 +49,26 @@ export class LiveFeedSimulator {
   private walkers: Walker[];
   private rand: () => number;
   private clock: number;
+  private grid: Grid | null;
+  private arena: typeof FALLBACK_ARENA;
 
-  constructor(seedStates: RobotState[], seed = 42, startClock = 0) {
+  constructor(seedStates: RobotState[], seed = 42, startClock = 0, grid: Grid | null = null) {
     this.rand = mulberry32(seed);
     this.clock = startClock;
+    this.grid = grid;
+    // With a grid, roam the whole walkable area so A* waypoints (free-cell
+    // centers) are always reachable without fighting a clamp boundary.
+    this.arena = grid
+      ? { minX: 0, maxX: grid.cols * grid.cell, minY: 0, maxY: grid.rows * grid.cell }
+      : FALLBACK_ARENA;
     this.walkers = seedStates.map((s) => ({
       id: s.robot_id,
       x: s.x,
       y: s.y,
       status: s.status === 'offline' ? 'idle' : s.status,
       battery: Math.min(100, Math.max(5, s.battery)),
-      target: null,
+      path: null,
+      headingToCharge: false,
       statusTimer: 0,
     }));
   }
@@ -81,13 +96,36 @@ export class LiveFeedSimulator {
     return events;
   }
 
+  /** Pick a random destination that is actually drivable, and route to it. */
+  private planRoute(w: Walker, dest: { x: number; y: number }): boolean {
+    if (!this.grid) {
+      w.path = [dest];
+      return true;
+    }
+    const path = findPath(this.grid, { x: w.x, y: w.y }, dest);
+    if (!path) return false;
+    w.path = path;
+    return true;
+  }
+
+  private randomFreePoint(): { x: number; y: number } {
+    for (let i = 0; i < 40; i++) {
+      const p = {
+        x: this.arena.minX + this.rand() * (this.arena.maxX - this.arena.minX),
+        y: this.arena.minY + this.rand() * (this.arena.maxY - this.arena.minY),
+      };
+      if (!this.grid || isFree(this.grid, p.x, p.y)) return p;
+    }
+    return { x: this.arena.minX, y: this.arena.minY };
+  }
+
   private tickWalker(w: Walker, dt: number) {
     // Fixed-duration statuses tick down before anything else.
     if (w.status === 'blocked' || w.status === 'error' || w.status === 'maintenance') {
       w.statusTimer -= dt;
       if (w.statusTimer <= 0) {
         w.status = 'idle';
-        w.target = null;
+        w.path = null;
       }
       return;
     }
@@ -96,18 +134,20 @@ export class LiveFeedSimulator {
       w.battery = Math.min(100, w.battery + CHARGE_PER_S * dt);
       if (w.battery >= FULL) {
         w.status = 'idle';
-        w.target = null;
+        w.path = null;
       }
       return;
     }
 
-    // Decision point: idle or arrived at target.
-    if (w.target === null) {
+    // Decision point: idle or finished a route.
+    if (w.path === null) {
       if (w.battery < LOW) {
         w.status = 'on_mission';
-        w.target = { ...CHARGE_DOCK };
-        // when it arrives there it will begin charging
-        (w as Walker & { headingToCharge?: boolean }).headingToCharge = true;
+        w.headingToCharge = true;
+        if (!this.planRoute(w, CHARGE_DOCK)) {
+          w.status = 'idle';
+          w.headingToCharge = false;
+        }
       } else {
         const roll = this.rand();
         if (roll < 0.02) {
@@ -124,33 +164,40 @@ export class LiveFeedSimulator {
           return;
         }
         w.status = this.rand() < 0.5 ? 'active' : 'on_mission';
-        (w as Walker & { headingToCharge?: boolean }).headingToCharge = false;
-        w.target = {
-          x: ARENA.minX + this.rand() * (ARENA.maxX - ARENA.minX),
-          y: ARENA.minY + this.rand() * (ARENA.maxY - ARENA.minY),
-        };
+        w.headingToCharge = false;
+        // Try a few destinations until one routes successfully.
+        for (let tries = 0; tries < 5 && w.path === null; tries++) {
+          this.planRoute(w, this.randomFreePoint());
+        }
+        if (w.path === null) return; // parked somewhere odd; idle this tick
       }
     }
 
-    // Move toward target.
-    const dx = w.target!.x - w.x;
-    const dy = w.target!.y - w.y;
-    const dist = Math.hypot(dx, dy);
-    const stepDist = SPEED * dt;
-    if (stepDist >= dist) {
-      w.x = w.target!.x;
-      w.y = w.target!.y;
-      const toCharge = (w as Walker & { headingToCharge?: boolean }).headingToCharge;
-      w.target = null;
-      w.status = toCharge ? 'charging' : 'idle';
-      (w as Walker & { headingToCharge?: boolean }).headingToCharge = false;
-    } else {
-      w.x += (dx / dist) * stepDist;
-      w.y += (dy / dist) * stepDist;
-      w.battery = Math.max(0, w.battery - DRAIN_PER_S * dt);
+    // Move along the route.
+    let stepDist = SPEED * dt;
+    while (stepDist > 0 && w.path && w.path.length > 0) {
+      const wp = w.path[0];
+      const dx = wp.x - w.x;
+      const dy = wp.y - w.y;
+      const dist = Math.hypot(dx, dy);
+      if (stepDist >= dist) {
+        w.x = wp.x;
+        w.y = wp.y;
+        w.path.shift();
+        stepDist -= dist;
+      } else {
+        w.x += (dx / dist) * stepDist;
+        w.y += (dy / dist) * stepDist;
+        stepDist = 0;
+      }
     }
-    w.battery = Math.min(100, Math.max(0, w.battery));
-    w.x = Math.min(ARENA.maxX, Math.max(ARENA.minX, w.x));
-    w.y = Math.min(ARENA.maxY, Math.max(ARENA.minY, w.y));
+    if (w.path && w.path.length === 0) {
+      w.path = null;
+      w.status = w.headingToCharge ? 'charging' : 'idle';
+      w.headingToCharge = false;
+    }
+    w.battery = Math.min(100, Math.max(0, w.battery - DRAIN_PER_S * dt));
+    w.x = Math.min(this.arena.maxX, Math.max(this.arena.minX, w.x));
+    w.y = Math.min(this.arena.maxY, Math.max(this.arena.minY, w.y));
   }
 }
